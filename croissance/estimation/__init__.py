@@ -7,7 +7,7 @@ import pandas
 
 from croissance.estimation.defaults import MINIMUM_VALID_OD, RESAMPLE_POINTS_PER_HOUR, MINIMUM_VALID_SLOPE, \
     MINIMUM_PHASE_LENGTH, PHASE_MIN_DELTA_LOG_OD, CURVE_MINIMUM_DURATION_HOURS
-from croissance.estimation.outliers import remove_outliers
+# from croissance.estimation.outliers import remove_outliers
 from croissance.estimation.ranking import rank_phases
 from croissance.estimation.regression import fit_exponential
 from croissance.estimation.smoothing import median_smoothing
@@ -56,11 +56,16 @@ class Estimator(object):
                  *,
                  segment_log_n0: bool = False,
                  constrain_n0: bool = False,
-                 n0: float = 0.0):
+                 n0: float = 0.0,
+                 first_derivative_sign: int = 1,
+                 second_derivative_sign: int = 1,
+                 ):
         self._logger = logging.getLogger(__name__)
         self._segment_log_n0 = segment_log_n0
         self._constrain_n0 = constrain_n0
         self._n0 = n0
+        self._first_derivative_sign = first_derivative_sign
+        self._second_derivative_sign = second_derivative_sign
 
     def _find_growth_phases(self, curve: 'pandas.Series', window) -> 'typing.List[RawGrowthPhase]':
         """
@@ -73,8 +78,26 @@ class Estimator(object):
         first_derivative = savitzky_golay(curve, window, 3, deriv=1)
         second_derivative = savitzky_golay(curve, window, 3, deriv=2)
 
-        growth = pandas.Series(index=curve.index,
-                               data=(first_derivative.values > 0) & (second_derivative.values > 0))
+        #print(self._first_derivative_sign, self._second_derivative_sign)
+
+        if self._first_derivative_sign==0 and self._second_derivative_sign==0:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values))
+        if self._first_derivative_sign==-1 and self._second_derivative_sign==0:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values < 0))
+        if self._first_derivative_sign==1 and self._second_derivative_sign==0:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values > 0))
+        if self._first_derivative_sign==0 and self._second_derivative_sign==-1:
+            growth = pandas.Series(index=curve.index, data=(second_derivative.values < 0))
+        if self._first_derivative_sign==0 and self._second_derivative_sign==1:
+            growth = pandas.Series(index=curve.index, data=(second_derivative.values > 0))
+        if self._first_derivative_sign==-1 and self._second_derivative_sign==-1:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values < 0) & (second_derivative.values < 0))
+        if self._first_derivative_sign==-1 and self._second_derivative_sign==1:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values < 0) & (second_derivative.values > 0))
+        if self._first_derivative_sign==1 and self._second_derivative_sign==-1:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values > 0) & (second_derivative.values < 0))
+        if self._first_derivative_sign==1 and self._second_derivative_sign==1:
+            growth = pandas.Series(index=curve.index, data=(first_derivative.values > 0) & (second_derivative.values > 0))
 
         istart, iend, phases = None, None, []
         for i, v in zip(growth.index, growth.values):
@@ -102,7 +125,8 @@ class Estimator(object):
         if n_hours % 2 == 0:
             n_hours += 1
 
-        series, outliers = remove_outliers(series, window=n_hours, std=3)
+        # series, outliers = remove_outliers(series, window=n_hours, std=3)
+        outliers = []
 
         # NOTE workaround for issue with negative curves
         if len(series[series > 0]) < 3:
@@ -116,6 +140,7 @@ class Estimator(object):
 
         phases = []
         raw_phases = self._find_growth_phases(smooth_series, window=n_hours)
+        #print(raw_phases)
 
         for phase in raw_phases:
             phase_series = series[phase.start:phase.end]
@@ -127,6 +152,7 @@ class Estimator(object):
             # skip any phases with less than minimum duration
             if phase.duration < defaults.PHASE_MINIMUM_DURATION_HOURS:
                 continue
+            #print('Checkpoint A', phase.start)
 
             # snr_estimate, slope_estimate = signal_noise_ratio_estimate(phase_series.values)
             # # skip any growth phase with <strike>an estimated S/N ratio < 1 or</strike> negative slope.
@@ -138,13 +164,18 @@ class Estimator(object):
             else:
                 slope, intercept, n0, snr, fallback_linear_method = fit_exponential(phase_series)
 
+            #print('Checkpoint B', phase.start)
+            #print(slope, snr)
+
             # skip phases whose actual slope is below the limit
-            if slope < max(0.0, defaults.PHASE_MINIMUM_SLOPE):
+            if abs(slope) < max(0.0, defaults.PHASE_MINIMUM_SLOPE):
                 continue
 
             # skip phases whose actual signal-noise-ratio is below the limit
-            if snr < max(1.0, defaults.PHASE_MINIMUM_SIGNAL_NOISE_RATIO):
+            if snr < max(0.0, defaults.PHASE_MINIMUM_SIGNAL_NOISE_RATIO):
                 continue
+
+            #print('Checkpoint C', phase.start)
 
             phases.append(GrowthPhase(phase.start, phase.end, slope, intercept, n0, {"SNR": snr}))
 
@@ -153,6 +184,8 @@ class Estimator(object):
             'duration': defaults.PHASE_MINIMUM_DURATION_HOURS,
             'slope': defaults.PHASE_MINIMUM_SLOPE
         })
+
+        #print([(phase.start,phase.rank) for phase in ranked_phases])
 
         return AnnotatedGrowthCurve(series, outliers, [phase for phase in ranked_phases
                                                        if phase.rank >= defaults.PHASE_RANK_EXCLUDE_BELOW])
